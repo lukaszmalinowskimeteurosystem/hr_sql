@@ -1,0 +1,494 @@
+
+-- FUNCTION: meteurosystem.update_approved_at_new()
+
+-- DROP FUNCTION IF EXISTS meteurosystem.update_approved_at_new();
+
+CREATE OR REPLACE FUNCTION meteurosystem.update_approved_at_new()
+    RETURNS trigger
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE NOT LEAKPROOF
+AS $BODY$
+BEGIN
+    -- Aktualizacja approved_at na bieżący znacznik czasu
+    UPDATE meteurosystem.hr_leave_requests
+    SET approved_at = CURRENT_TIMESTAMP
+    WHERE id = NEW.id;
+
+    RETURN NEW;
+END;
+$BODY$;
+
+ALTER FUNCTION meteurosystem.update_approved_at_new()
+    OWNER TO testdbuser;
+
+-- Funkcja: meteurosystem.fn_log_generic_changes()
+
+-- FUNCTION: meteurosystem.fn_log_generic_changes()
+ -- DROP FUNCTION IF EXISTS meteurosystem.fn_log_generic_changes();
+
+CREATE OR REPLACE FUNCTION meteurosystem.fn_log_generic_changes() RETURNS trigger LANGUAGE 'plpgsql' COST 100 VOLATILE NOT LEAKPROOF AS $BODY$
+DECLARE
+    v_user TEXT := session_user;
+    v_old hstore;
+    v_new hstore;
+    v_key TEXT;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        v_new := hstore(NEW);
+        FOREACH v_key IN ARRAY akeys(v_new) LOOP
+            INSERT INTO meteurosystem.hr_change_log (
+                changed_by, table_name, operation_type, record_id,
+                column_name, old_value, new_value
+            )
+            VALUES (
+                v_user, TG_TABLE_NAME, 'INSERT', NEW.id,
+                v_key, NULL, v_new -> v_key
+            );
+        END LOOP;
+
+    ELSIF TG_OP = 'UPDATE' THEN
+        v_old := hstore(OLD);
+        v_new := hstore(NEW);
+
+        FOREACH v_key IN ARRAY akeys(v_new) LOOP
+            IF v_old -> v_key IS DISTINCT FROM v_new -> v_key THEN
+                INSERT INTO meteurosystem.hr_change_log (
+                    changed_by, table_name, operation_type, record_id,
+                    column_name, old_value, new_value
+                )
+                VALUES (
+                    v_user, TG_TABLE_NAME, 'UPDATE', NEW.id,
+                    v_key, v_old -> v_key, v_new -> v_key
+                );
+            END IF;
+        END LOOP;
+    END IF;
+
+    RETURN NULL;
+END;
+$BODY$;
+
+
+ALTER FUNCTION meteurosystem.fn_log_generic_changes() OWNER TO testdbuser;
+
+-------------------------------
+
+-- FUNCTION: meteurosystem.update_leave_balances_new()
+
+-- DROP FUNCTION IF EXISTS meteurosystem.update_leave_balances_new();
+
+CREATE OR REPLACE FUNCTION meteurosystem.update_leave_balances_new()
+    RETURNS trigger
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE NOT LEAKPROOF
+AS $BODY$
+DECLARE
+    curr_overdue NUMERIC;
+    new_overdue NUMERIC;
+
+    curr_current_year NUMERIC;
+  --  new_current_year NUMERIC;
+
+    curr_used_days NUMERIC;
+    curr_used_from_current NUMERIC;
+    used_from_current_increment NUMERIC := 0;
+
+    diff NUMERIC;
+BEGIN
+    RAISE NOTICE 'Trigger fired for employee_id = %, leave_type_id = %, requested_days = %',
+                 NEW.employee_id, NEW.leave_type_id, NEW.requested_days;
+
+    IF NEW.leave_type_id = 8 THEN
+        -- UŻ: Zdejmujemy tylko z current_year w leave_type_id = 2
+
+        SELECT current_year, used_days, used_from_current_year, overdue
+          INTO curr_current_year, curr_used_days, curr_used_from_current, curr_overdue
+          FROM meteurosystem.hr_leave_balances_new
+         WHERE employee_id = NEW.employee_id AND leave_type_id = 2
+         FOR UPDATE;
+
+      --  new_current_year := curr_current_year;
+        used_from_current_increment := NEW.requested_days;
+
+        -- Aktualizacja salda głównego leave_type_id = 2
+        UPDATE meteurosystem.hr_leave_balances_new
+           SET 
+		   --current_year = new_current_year,
+               used_days = curr_used_days + NEW.requested_days,
+               used_from_current_year = curr_used_from_current + used_from_current_increment,
+             --  remaining_holiday = curr_overdue + GREATEST(0, new_current_year - (curr_used_from_current + used_from_current_increment))
+			 remaining_holiday = curr_overdue + GREATEST(0, curr_current_year - (curr_used_from_current + used_from_current_increment))
+         WHERE employee_id = NEW.employee_id AND leave_type_id = 2;
+
+        -- Aktualizacja salda UŻ (pomocniczy licznik, nie zmieniamy remaining_holiday ręcznie!)
+        UPDATE meteurosystem.hr_leave_balances_new
+           SET 
+		   --current_year = new_current_year,
+		   --current_year = current_year - NEW.requested_days,
+               used_days = used_days + NEW.requested_days,
+			   remaining_holiday = remaining_holiday - NEW.requested_days
+         WHERE employee_id = NEW.employee_id AND leave_type_id = 8;
+
+    ELSE
+        -- Pozostałe typy (wypoczynkowy leave_type_id = 2, itp.)
+
+        SELECT overdue, current_year, used_days, used_from_current_year
+          INTO curr_overdue, curr_current_year, curr_used_days, curr_used_from_current
+          FROM meteurosystem.hr_leave_balances_new
+         WHERE employee_id = NEW.employee_id AND leave_type_id = NEW.leave_type_id
+         FOR UPDATE;
+
+      --  new_current_year := curr_current_year;
+        new_overdue := curr_overdue;
+
+        IF curr_overdue > 0 THEN
+            IF NEW.requested_days <= curr_overdue THEN
+                new_overdue := curr_overdue - NEW.requested_days;
+                used_from_current_increment := 0;
+            ELSE
+                diff := NEW.requested_days - curr_overdue;
+                new_overdue := 0;
+              --  new_current_year := curr_current_year;
+                used_from_current_increment := diff;
+            END IF;
+        ELSE
+          --  new_current_year := curr_current_year;
+            used_from_current_increment := NEW.requested_days;
+        END IF;
+
+        UPDATE meteurosystem.hr_leave_balances_new
+           SET overdue = new_overdue,
+             --  current_year = new_current_year,
+               used_days = curr_used_days + NEW.requested_days,
+               used_from_current_year = curr_used_from_current + used_from_current_increment,
+               remaining_holiday = new_overdue + GREATEST(0, curr_current_year - (curr_used_from_current + used_from_current_increment))
+         WHERE employee_id = NEW.employee_id AND leave_type_id = NEW.leave_type_id;
+
+        RAISE NOTICE 'Update executed for employee_id = % for leave_type_id = %',
+                     NEW.employee_id, NEW.leave_type_id;
+    END IF;
+
+    RETURN NEW;
+END;
+$BODY$;
+
+ALTER FUNCTION meteurosystem.update_leave_balances_new()
+    OWNER TO testdbuser;
+
+------------------------------
+
+---------------------
+
+-- FUNCTION: meteurosystem.update_leave_cancellation()
+
+-- DROP FUNCTION IF EXISTS meteurosystem.update_leave_cancellation();
+
+CREATE OR REPLACE FUNCTION meteurosystem.update_leave_cancellation()
+    RETURNS trigger
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE NOT LEAKPROOF
+AS $BODY$
+DECLARE
+    curr_overdue NUMERIC;
+    new_overdue NUMERIC;
+
+    curr_current_year NUMERIC;
+    new_current_year NUMERIC;
+
+    diff NUMERIC;
+BEGIN
+    RAISE NOTICE 'Leave cancellation for employee_id = %, leave_type_id = %, requested_days = %',
+                 OLD.employee_id, OLD.leave_type_id, OLD.requested_days;
+
+    IF OLD.leave_type_id = 8 THEN
+        ---------------------------------------------------------------------
+        -- Anulowanie wniosku dla leave_type_id = 8: dotyczy także leave_type_id = 2
+        ---------------------------------------------------------------------
+
+        SELECT overdue, current_year
+          INTO curr_overdue, curr_current_year
+          FROM meteurosystem.hr_leave_balances_new
+         WHERE employee_id = OLD.employee_id AND leave_type_id = 2
+         FOR UPDATE;
+
+        -- Przywracamy dni do current_year
+        --new_current_year := curr_current_year + OLD.requested_days;
+        new_overdue := curr_overdue;  -- zakładamy, że wszystkie dni były z current_year
+
+        UPDATE meteurosystem.hr_leave_balances_new
+           SET overdue = new_overdue,
+               --current_year = new_current_year,
+               remaining_holiday = remaining_holiday + OLD.requested_days,
+               used_days = used_days - OLD.requested_days,
+			   used_from_current_year = used_from_current_year - OLD.requested_days
+         WHERE employee_id = OLD.employee_id AND leave_type_id = 2;
+
+        UPDATE meteurosystem.hr_leave_balances_new
+           SET remaining_holiday = remaining_holiday + OLD.requested_days,
+		   		--current_year = current_year + OLD.requested_days,
+               used_days = used_days - OLD.requested_days
+			  -- used_from_current_year = used_from_current_year - OLD.requested_days
+         WHERE employee_id = OLD.employee_id AND leave_type_id = 8;
+
+    ELSE
+        ---------------------------------------------------------------------
+        -- Anulowanie dla innych typów (np. leave_type_id = 2, 3, itd.)
+        ---------------------------------------------------------------------
+
+        SELECT overdue, current_year
+          INTO curr_overdue, curr_current_year
+          FROM meteurosystem.hr_leave_balances_new
+         WHERE employee_id = OLD.employee_id AND leave_type_id = OLD.leave_type_id
+         FOR UPDATE;
+
+        IF curr_overdue > 0 THEN
+            -- Przywracamy najpierw do overdue, potem do current_year
+            new_overdue := curr_overdue + LEAST(OLD.requested_days, OLD.requested_days); -- pełna kwota, zakładamy że odejmowaliśmy w całości z overdue
+            diff := OLD.requested_days - LEAST(OLD.requested_days, curr_overdue);
+           -- new_current_year := curr_current_year + diff;
+        ELSE
+            -- Wszystkie dni przywracane do current_year
+            new_overdue := curr_overdue;
+            new_current_year := curr_current_year + OLD.requested_days;
+        END IF;
+
+        UPDATE meteurosystem.hr_leave_balances_new
+           SET overdue = new_overdue,
+              -- current_year = new_current_year,
+               remaining_holiday = remaining_holiday + OLD.requested_days,
+               used_days = used_days - OLD.requested_days,
+			   used_from_current_year = used_from_current_year - OLD.requested_days
+         WHERE employee_id = OLD.employee_id AND leave_type_id = OLD.leave_type_id;
+
+        RAISE NOTICE 'Leave restored for employee_id = %, leave_type_id = %',
+                     OLD.employee_id, OLD.leave_type_id;
+    END IF;
+
+    RETURN OLD;
+END;
+$BODY$;
+
+ALTER FUNCTION meteurosystem.update_leave_cancellation()
+    OWNER TO testdbuser;
+
+-------------------------------
+
+
+
+-- Tabele referencyjne minimalne (stub) na potrzeby FK
+CREATE TABLE IF NOT EXISTS public.tb_pracownicy (
+    p_idpracownika serial PRIMARY KEY,
+    p_imie text,
+    p_nazwisko text
+);
+
+------------------------------------------------------------
+-- Table: meteurosystem.hr_change_log
+
+-- DROP TABLE IF EXISTS meteurosystem.hr_change_log;
+
+CREATE TABLE IF NOT EXISTS meteurosystem.hr_change_log
+(
+    id serial PRIMARY KEY,
+    changed_at timestamp without time zone NOT NULL DEFAULT now(),
+    changed_by text COLLATE pg_catalog."default",
+    table_name text COLLATE pg_catalog."default" NOT NULL,
+    operation_type text COLLATE pg_catalog."default" NOT NULL,
+    record_id integer,
+    column_name text COLLATE pg_catalog."default",
+    old_value text COLLATE pg_catalog."default",
+    new_value text COLLATE pg_catalog."default",
+    CONSTRAINT hr_change_log_operation_type_check CHECK (operation_type = ANY (ARRAY['INSERT'::text, 'UPDATE'::text, 'DELETE'::text]))
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE IF EXISTS meteurosystem.hr_change_log
+    OWNER to testdbuser;
+------------------------------------------------------------
+
+-- Typy nieobecności
+CREATE TABLE IF NOT EXISTS meteurosystem.hr_types_hol_req (
+    id integer  PRIMARY KEY,
+    nazwa text,
+    skrot text,
+    ograniczenie integer
+);
+
+ALTER TABLE IF EXISTS meteurosystem.hr_types_hol_req OWNER TO testdbuser;
+
+-- Typy umów
+CREATE TABLE IF NOT EXISTS meteurosystem.hr_contract_type (
+    id integer PRIMARY KEY,
+    typ_umowy text NOT NULL
+);
+
+ALTER TABLE IF EXISTS meteurosystem.hr_contract_type OWNER TO testdbuser;
+
+-- Informacje HR
+CREATE TABLE IF NOT EXISTS meteurosystem.hr_info (
+    id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    employee_id integer,
+    employment_date date NOT NULL,
+    contract_end_date date,
+    leave_entitlement integer NOT NULL,
+    umowa_id integer,
+    CONSTRAINT uq_hr_info_employee_id UNIQUE (employee_id),
+    CONSTRAINT fk_employee_id FOREIGN KEY (employee_id)
+        REFERENCES public.tb_pracownicy (p_idpracownika)
+        ON UPDATE CASCADE
+        ON DELETE SET NULL,
+    CONSTRAINT fk_umowa FOREIGN KEY (umowa_id)
+        REFERENCES meteurosystem.hr_contract_type (id)
+        ON UPDATE NO ACTION
+        ON DELETE NO ACTION
+);
+
+ALTER TABLE IF EXISTS meteurosystem.hr_info OWNER TO testdbuser;
+
+-- Salda urlopowe
+CREATE TABLE IF NOT EXISTS meteurosystem.hr_leave_balances_new
+(
+    id serial NOT NULL ,
+    overdue integer NOT NULL,
+    current_year integer NOT NULL,
+    next_year integer NOT NULL,
+    used_days integer NOT NULL,
+    remaining_holiday integer NOT NULL,
+    employee_id integer NOT NULL,
+    leave_type_id integer NOT NULL,
+    used_from_current_year integer DEFAULT 0,
+    CONSTRAINT hr_leave_balances_new_pkey PRIMARY KEY (id),
+    CONSTRAINT fk_employee_id FOREIGN KEY (employee_id)
+        REFERENCES public.tb_pracownicy (p_idpracownika) MATCH SIMPLE
+        ON UPDATE CASCADE
+        ON DELETE SET NULL,
+    CONSTRAINT fk_leave_type FOREIGN KEY (leave_type_id)
+        REFERENCES meteurosystem.hr_types_hol_req (id) MATCH SIMPLE
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE IF EXISTS meteurosystem.hr_leave_balances_new
+    OWNER to testdbuser;
+
+-- Trigger: trg_log_hr_leave_balances_new
+
+-- DROP TRIGGER IF EXISTS trg_log_hr_leave_balances_new ON meteurosystem.hr_leave_balances_new;
+
+CREATE OR REPLACE TRIGGER trg_log_hr_leave_balances_new
+    AFTER INSERT OR UPDATE 
+    ON meteurosystem.hr_leave_balances_new
+    FOR EACH ROW
+    EXECUTE FUNCTION meteurosystem.fn_log_generic_changes();
+
+
+--------------------------------------------------------------
+--------------------------------------------------------------
+
+-- Table: meteurosystem.hr_types_hol_req
+
+-- DROP TABLE IF EXISTS meteurosystem.hr_types_hol_req;
+
+CREATE TABLE IF NOT EXISTS meteurosystem.hr_types_hol_req
+(
+    nazwa text COLLATE pg_catalog."default",
+    skrot text COLLATE pg_catalog."default",
+    id integer NOT NULL GENERATED BY DEFAULT AS IDENTITY ( INCREMENT 1 START 1 MINVALUE 1 MAXVALUE 2147483647 CACHE 1 ),
+    ograniczenie integer,
+    CONSTRAINT hr_types_hol_req_pkey PRIMARY KEY (id)
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE IF EXISTS meteurosystem.hr_types_hol_req
+    OWNER to testdbuser;
+
+--------------------------------------------------------------
+--------------------------------------------------------------
+
+--wnioski urlopowe
+-- Table: meteurosystem.hr_leave_requests
+
+-- DROP TABLE IF EXISTS meteurosystem.hr_leave_requests;
+
+CREATE TABLE IF NOT EXISTS meteurosystem.hr_leave_requests
+(
+    id serial NOT NULL,
+    employee_id integer NOT NULL,
+    start_date date NOT NULL,
+    end_date date NOT NULL,
+    leave_type_id integer NOT NULL,
+    status integer NOT NULL,
+    submitted_at timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    approved_at timestamp without time zone,
+    approver_id integer,
+    requested_days integer NOT NULL,
+    requester integer NOT NULL DEFAULT 0,
+    CONSTRAINT hr_leave_requests_pkey PRIMARY KEY (id),
+    CONSTRAINT fk_approver FOREIGN KEY (approver_id)
+        REFERENCES public.tb_pracownicy (p_idpracownika) MATCH SIMPLE
+        ON UPDATE CASCADE
+        ON DELETE SET NULL,
+    CONSTRAINT fk_employee FOREIGN KEY (employee_id)
+        REFERENCES public.tb_pracownicy (p_idpracownika) MATCH SIMPLE
+        ON UPDATE CASCADE
+        ON DELETE CASCADE,
+    CONSTRAINT fk_leave_type FOREIGN KEY (leave_type_id)
+        REFERENCES meteurosystem.hr_types_hol_req (id) MATCH SIMPLE
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE IF EXISTS meteurosystem.hr_leave_requests
+    OWNER to testdbuser;
+
+-- Trigger: after_leave_cancellation
+
+-- DROP TRIGGER IF EXISTS after_leave_cancellation ON meteurosystem.hr_leave_requests;
+
+CREATE OR REPLACE TRIGGER after_leave_cancellation
+    AFTER UPDATE OF status
+    ON meteurosystem.hr_leave_requests
+    FOR EACH ROW
+    WHEN (old.status = 2 AND new.status = 4)
+    EXECUTE FUNCTION meteurosystem.update_leave_cancellation();
+
+-- Trigger: after_leave_type_update_new
+
+-- DROP TRIGGER IF EXISTS after_leave_type_update_new ON meteurosystem.hr_leave_requests;
+
+CREATE OR REPLACE TRIGGER after_leave_type_update_new
+    AFTER UPDATE OF status
+    ON meteurosystem.hr_leave_requests
+    FOR EACH ROW
+    WHEN (old.status IS DISTINCT FROM new.status AND new.status = 2)
+    EXECUTE FUNCTION meteurosystem.update_leave_balances_new();
+
+-- Trigger: trg_log_hr_leave_requests
+
+-- DROP TRIGGER IF EXISTS trg_log_hr_leave_requests ON meteurosystem.hr_leave_requests;
+
+CREATE OR REPLACE TRIGGER trg_log_hr_leave_requests
+    AFTER INSERT OR UPDATE 
+    ON meteurosystem.hr_leave_requests
+    FOR EACH ROW
+    EXECUTE FUNCTION meteurosystem.fn_log_generic_changes();
+
+-- Trigger: update_approved_at_on_status_change_new
+
+-- DROP TRIGGER IF EXISTS update_approved_at_on_status_change_new ON meteurosystem.hr_leave_requests;
+
+CREATE OR REPLACE TRIGGER update_approved_at_on_status_change_new
+    AFTER UPDATE OF status
+    ON meteurosystem.hr_leave_requests
+    FOR EACH ROW
+    WHEN (old.status IS DISTINCT FROM new.status)
+    EXECUTE FUNCTION meteurosystem.update_approved_at_new();
