@@ -265,6 +265,7 @@ def test_wnioski_urlopowe():
     assert row["used_from_current_year"] == 9
 
 
+####################################################################
 # # 2. UPDATE: przedłużenie umowy do stycznia 2027
 # execute(
 #     """
